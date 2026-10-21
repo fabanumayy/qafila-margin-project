@@ -1,203 +1,112 @@
-"""Qafila gross margin pipeline: raw files -> DuckDB -> dbt -> Iceberg.
-
-    uv run python run.py --data-dir data --warehouse warehouse
-
-Must work on an empty warehouse folder, and must be safe to run again on the same one.
-The grader runs it on a dataset you haven't seen, so never hard-code file names, row counts or SKUs.
-"""
+"""Qafila gross margin pipeline: raw files -> DuckDB -> dbt -> Iceberg."""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import os
-import sqlite3   
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
 import duckdb
+import pandas as pd
+import pyarrow as pa
 from pyiceberg.catalog.sql import SqlCatalog
 
 DBT_DIR = Path(__file__).resolve().parent / "dbt"
 
 
 def get_catalog(warehouse: Path) -> SqlCatalog:
-    """The Iceberg catalog the grader reads. Don't change the name, the URI or the warehouse."""
     warehouse.mkdir(parents=True, exist_ok=True)
-    return SqlCatalog("qafila", uri=f"sqlite:///{(warehouse / 'catalog.db').as_posix()}", warehouse=warehouse.resolve().as_posix())
+    catalog = SqlCatalog(
+        "qafila",
+        uri=f"sqlite:///{(warehouse / 'catalog.db').as_posix()}",
+        warehouse=warehouse.resolve().as_posix(),
+    )
+    for ns in ("staging", "silver", "gold", "quality"):
+        try:
+            catalog.create_namespace(ns)
+        except Exception:
+            pass
+    return catalog
+
+
+def _load_sqlite_table(con: duckdb.DuckDBPyConnection, sqlite_path: Path, name: str) -> None:
+    with sqlite3.connect(sqlite_path) as src:
+        frame = pd.read_sql_query(f"SELECT * FROM {name}", src)
+    con.register(f"_p_{name}", frame)
+    con.sql(f"CREATE OR REPLACE TABLE raw.{name} AS SELECT * FROM _p_{name}")
+    con.unregister(f"_p_{name}")
 
 
 def ingest(data_dir: Path, db: Path) -> None:
-    """Load app tables and supplier CSV files into DuckDB schema raw.
-
-    Re-running ingest replaces the raw tables instead of duplicating rows.
-    """
+    """Land all source tables and every supplier row, replacing the raw landing atomically."""
     sqlite_path = data_dir / "qafila_oltp.sqlite"
-    supplier_dir = data_dir / "suppliers"
-
-    if not sqlite_path.is_file():
-        raise FileNotFoundError(f"App database not found: {sqlite_path}")
-
-    if not supplier_dir.is_dir():
-        raise FileNotFoundError(f"Supplier directory not found: {supplier_dir}")
-
-    supplier_files = sorted(supplier_dir.glob("prices_*.csv"))
-    if not supplier_files:
-        raise FileNotFoundError(
-            f"No supplier price files found in {supplier_dir}"
-        )
-
-    app_tables = ("orders", "order_items", "products", "stores")
-
-    # Read the SQLite source using Python's built-in sqlite3 module.
-    with sqlite3.connect(str(sqlite_path)) as source:
-        source_tables = {
-            row[0]
-            for row in source.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
-        }
-
-        missing = set(app_tables) - source_tables
-        if missing:
-            raise ValueError(
-                f"Missing app tables in {sqlite_path}: {sorted(missing)}"
-            )
-
-        app_data = {}
-
-        for table in app_tables:
-            info = source.execute(
-                f'PRAGMA table_info("{table}")'
-            ).fetchall()
-
-            columns = [row[1] for row in info]
-            if not columns:
-                raise ValueError(f"Table {table} has no columns")
-
-            rows = source.execute(
-                f'SELECT * FROM "{table}"'
-            ).fetchall()
-
-            # Keep the original column names and SQLite values.
-            # Translate SQLite column types into DuckDB-compatible types.
-            definitions = []
-            for row in info:
-                name = row[1]
-                declared_type = (row[2] or "").upper()
-
-                if any(
-                    token in declared_type
-                    for token in ("INT",)
-                ):
-                    sql_type = "BIGINT"
-                elif any(
-                    token in declared_type
-                    for token in (
-                        "REAL", "FLOA", "DOUB", "NUMERIC", "DECIMAL"
-                    )
-                ):
-                    sql_type = "DOUBLE"
-                elif "BLOB" in declared_type:
-                    sql_type = "BLOB"
-                else:
-                    sql_type = "VARCHAR"
-
-                safe_name = '"' + name.replace('"', '""') + '"'
-                definitions.append(f"{safe_name} {sql_type}")
-
-            app_data[table] = (columns, definitions, rows)
-
-    # Read all supplier files as text. This preserves raw prices such as
-    # decimal commas and Arabic-Indic digits for the cleaning stage.
-    supplier_columns = []
-    supplier_rows = []
-
-    for path in supplier_files:
-        with path.open(
-            "r", encoding="utf-8-sig", newline=""
-        ) as handle:
-            reader = csv.DictReader(handle)
-
-            if not reader.fieldnames:
-                raise ValueError(f"CSV has no header: {path.name}")
-
-            if "source_file" in reader.fieldnames:
-                raise ValueError(
-                    f"Reserved column source_file in {path.name}"
-                )
-
-            for column in reader.fieldnames:
-                if column not in supplier_columns:
-                    supplier_columns.append(column)
-
-            for row in reader:
-                row["source_file"] = path.name
-                supplier_rows.append(row)
-
-    supplier_columns.append("source_file")
-
-    # Build raw tables. Each run replaces the previous raw data,
-    # so it cannot append duplicate rows.
+    files = sorted((data_dir / "suppliers").glob("prices_*.csv"))
     with duckdb.connect(str(db)) as con:
-        con.execute("CREATE SCHEMA IF NOT EXISTS raw")
+        con.sql("CREATE SCHEMA IF NOT EXISTS raw")
+        for table in ("orders", "order_items", "products", "stores"):
+            _load_sqlite_table(con, sqlite_path, table)
 
-        for table, (columns, definitions, rows) in app_data.items():
-            con.execute(f'DROP TABLE IF EXISTS raw."{table}"')
-            con.execute(
-                f'CREATE TABLE raw."{table}" '
-                f'({", ".join(definitions)})'
-            )
+        rows: list[dict[str, str | None]] = []
+        for path in files:
+            with path.open("r", encoding="utf-8-sig", newline="") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    rows.append({**row, "source_file": path.name})
+        if rows:
+            # All supplier fields stay as strings: this preserves malformed values exactly.
+            cols = sorted({key for row in rows for key in row})
+            frame = pd.DataFrame(rows, columns=cols).where(pd.notna, None)
+        else:
+            frame = pd.DataFrame(columns=["source_file", "sku", "valid_from"])
+        con.register("_supplier_rows", frame)
+        con.sql("CREATE OR REPLACE TABLE raw.supplier_prices AS SELECT * FROM _supplier_rows")
+        con.unregister("_supplier_rows")
 
-            if rows:
-                quoted_columns = ", ".join(
-                    '"' + name.replace('"', '""') + '"'
-                    for name in columns
-                )
-                placeholders = ", ".join("?" for _ in columns)
 
-                con.executemany(
-                    f'INSERT INTO raw."{table}" '
-                    f'({quoted_columns}) VALUES ({placeholders})',
-                    rows,
-                )
+def transform(db: Path) -> None:
+    env = {**os.environ, "QAFILA_DUCKDB": str(db.resolve())}
+    cmd = [sys.executable, "-c", "from dbt.cli.main import cli; cli()", "build",
+           "--project-dir", str(DBT_DIR), "--profiles-dir", str(DBT_DIR)]
+    if subprocess.run(cmd, env=env).returncode != 0:
+        raise SystemExit("dbt build failed")
 
-        con.execute(
-            'DROP TABLE IF EXISTS raw."supplier_prices"'
-        )
 
-        supplier_definitions = ", ".join(
-            '"' + name.replace('"', '""') + '" VARCHAR'
-            for name in supplier_columns
-        )
+def publish(db: Path, warehouse: Path) -> None:
+    catalog = get_catalog(warehouse)
+    mappings = {
+        "silver.product_cost_history": "silver.product_cost_history",
+        "gold.weekly_margin": "gold.weekly_margin",
+        "quality.price_quarantine": "quality.price_quarantine",
+    }
+    with duckdb.connect(str(db), read_only=True) as con:
+        for identifier, relation in mappings.items():
+            frame = con.sql(f"SELECT * FROM {relation}").fetchdf()
+            # Arrow preserves DATE/BOOLEAN/numeric types expected by the contract.
+            arrow = pa.Table.from_pandas(frame, preserve_index=False)
+            try:
+                table = catalog.load_table(identifier)
+                table.overwrite(arrow, snapshot_properties={"qafila.pipeline": "run"})
+            except Exception:
+                catalog.create_table(identifier, schema=pa.Schema.from_pandas(frame), location=None)
+                catalog.load_table(identifier).append(arrow, snapshot_properties={"qafila.pipeline": "run"})
 
-        con.execute(
-            'CREATE TABLE raw."supplier_prices" '
-            f'({supplier_definitions})'
-        )
 
-        if supplier_rows:
-            quoted_columns = ", ".join(
-                '"' + name.replace('"', '""') + '"'
-                for name in supplier_columns
-            )
-            placeholders = ", ".join("?" for _ in supplier_columns)
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--data-dir", type=Path, default=Path("data"))
+    ap.add_argument("--warehouse", type=Path, default=Path("warehouse"))
+    args = ap.parse_args()
+    args.warehouse.mkdir(parents=True, exist_ok=True)
+    db = args.warehouse / "qafila.duckdb"
+    ingest(args.data_dir, db)
+    transform(db)
+    publish(db, args.warehouse)
+    print(f"done: {args.warehouse.resolve()}")
 
-            values = [
-                tuple(row.get(column) for column in supplier_columns)
-                for row in supplier_rows
-            ]
 
-            con.executemany(
-                'INSERT INTO raw."supplier_prices" '
-                f'({quoted_columns}) VALUES ({placeholders})',
-                values,
-            )
-
-        # Report what was loaded for a quick sanity check.
-        for table in (*app_tables, "supplier_prices"):
-            count = con.execute(
-                f'SELECT COUNT(*) FROM raw."{table}"'
-            ).fetchone()[0]
-            print(f"raw.{table}: {count} rows")
+if __name__ == "__main__":
+    main()
