@@ -1,6 +1,6 @@
 # Qafila gross margin
 
-Submitted by: `<your name>` — academy: @SDAIAAcademy
+Submitted by: `fabanumayy` — academy: @SDAIAAcademy
 
 ## Design
 
